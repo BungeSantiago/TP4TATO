@@ -1,77 +1,114 @@
+/*------------------------------------------------------------------
+ *  ring.c  –  TP 4 (Comunicación en anillo)
+ *
+ *  Uso:  ./ring <n> <c> <s>
+ *        n : número de procesos hijos    (n ≥ 3)
+ *        c : entero inicial
+ *        s : hijo que inicia el recorrido  (1 ≤ s ≤ n)
+ *
+ *  Cada hijo incrementa el valor una vez y lo reenvía.
+ *  Cuando el último hijo escribe en result_pipe, el padre
+ *  lee y muestra el valor final.
+ *-----------------------------------------------------------------*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
-static void die(const char *msg) { perror(msg); exit(EXIT_FAILURE); }
+#define DIE(msg)  do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
 int main(int argc, char *argv[])
 {
+    /* --- 0. Validación de argumentos ----------------------------------- */
     if (argc != 4) {
         fprintf(stderr, "Uso: %s <n> <c> <s>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    int n = atoi(argv[1]), val = atoi(argv[2]), s = atoi(argv[3]);
-    if (n < 3 || s < 1 || s > n) {
-        fprintf(stderr, "Argumentos inválidos\n");
+    int n      = atoi(argv[1]);
+    int value  = atoi(argv[2]);
+    int start  = atoi(argv[3]);          /* índices 1-based */
+
+    if (n < 3 || start < 1 || start > n) {
+        fprintf(stderr, "Error:  n ≥ 3  y  1 ≤ s ≤ n\n");
         return EXIT_FAILURE;
     }
 
-    /* 1) Pipes del anillo entre hijos */
-    int ring[n][2];
-    for (int i = 0; i < n; ++i) if (pipe(ring[i])) die("pipe");
+    /* --- 1. Reservar estructura de pipes del anillo --------------------- */
+    int (*ring)[2] = malloc(n * sizeof *ring);
+    if (!ring) DIE("malloc");
 
-    /* 2) Pipe hijo_last → padre  y  padre → hijo_s                    */
-    int p_last2par[2], p_par2start[2];
-    if (pipe(p_last2par) || pipe(p_par2start)) die("pipe-parent");
+    for (int i = 0; i < n; ++i)
+        if (pipe(ring[i]) == -1) DIE("pipe ring");
 
-    int last = (s + n - 2) % n;            /* hijo que cierra el lazo   */
+    /* Tubos exclusivos del padre */
+    int start_pipe[2], result_pipe[2];
+    if (pipe(start_pipe) == -1 || pipe(result_pipe) == -1)
+        DIE("pipe padre");
 
-    for (int i = 0; i < n; ++i) {
+    int last = (start == 1) ? n : start - 1;   /* hijo que cierra el ciclo */
+
+    /* --- 2. Crear los hijos -------------------------------------------- */
+    for (int idx = 1; idx <= n; ++idx) {
         pid_t pid = fork();
-        if (pid < 0) die("fork");
+        if (pid < 0) DIE("fork");
 
-        if (pid == 0) {                    /* ====== HIJO i ====== */
-            /* Elegir fds de entrada y salida */
-            int in_fd  = (i == (s-1)) ? p_par2start[0]
-                       : ring[(i-1+n)%n][0];
+        if (pid == 0) {            /* ======= HIJO idx ======= */
 
-            int out_fd = (i == last) ? p_last2par[1]
-                       : ring[i][1];
+            /* Elegir fds de entrada y salida para este hijo */
+            int in_fd  = (idx == start) ? start_pipe[0]
+                                        : ring[(idx - 2 + n) % n][0];
 
-            /* Cerrar todo lo que no se usa */
+            int out_fd = (idx == last)  ? result_pipe[1]
+                                        : ring[(idx - 1) % n][1];
+
+            /* Cerrar todo lo que no corresponde */
             for (int j = 0; j < n; ++j) {
-                close(ring[j][0]); close(ring[j][1]);
+                if (ring[j][0] != in_fd)   close(ring[j][0]);
+                if (ring[j][1] != out_fd)  close(ring[j][1]);
             }
-            close(p_par2start[1]);               /* ya lo usa el padre  */
-            close(p_last2par[0]);                /* idem               */
-            if (i != (s-1))  close(p_par2start[0]);
-            if (i != last )  close(p_last2par[1]);
+            /* Extremos del padre */
+            close(start_pipe[1]);  /* solo escribe el padre      */
+            close(result_pipe[0]); /* solo lee    el padre       */
+            if (idx != start) close(start_pipe[0]);
+            if (idx != last ) close(result_pipe[1]);
 
-            /* Trabajo: leer, ++, escribir y terminar */
-            if (read(in_fd, &val, sizeof(val)) != sizeof(val)) exit(EXIT_FAILURE);
-            ++val;
-            if (write(out_fd, &val, sizeof(val)) != sizeof(val)) exit(EXIT_FAILURE);
+            /* Trabajo: leer, ++ y reenviar */
+            if (read(in_fd, &value, sizeof value) != sizeof value)
+                DIE("read hijo");
+            ++value;
+            if (write(out_fd, &value, sizeof value) != sizeof value)
+                DIE("write hijo");
 
-            close(in_fd); close(out_fd);
+            close(in_fd);
+            close(out_fd);
             _exit(EXIT_SUCCESS);
         }
-        /* ====== PADRE continúa el bucle para crear más hijos ====== */
+        /* El padre sigue creando al resto */
     }
 
-    /* ====== PADRE ====== */
-    /* Cerrar extremos inútiles */
-    for (int i = 0; i < n; ++i) { close(ring[i][0]); close(ring[i][1]); }
-    close(p_par2start[0]);  close(p_last2par[1]);
+    /* --- 3. PADRE ------------------------------------------------------- */
+    /* Cerrar anillo completo: el padre no lo usa */
+    for (int i = 0; i < n; ++i) {
+        close(ring[i][0]);
+        close(ring[i][1]);
+    }
+    free(ring);
 
-    /* Enviar valor inicial y esperar resultado */
-    write(p_par2start[1], &val, sizeof(val));
-    close(p_par2start[1]);
+    /* El padre solo escribe por start_pipe[1] y lee por result_pipe[0] */
+    close(start_pipe[0]);
+    close(result_pipe[1]);
 
-    if (read(p_last2par[0], &val, sizeof(val)) != sizeof(val))
-        die("read resultado");
-    printf("Resultado final: %d\n", val);
-    close(p_last2par[0]);
+    /* Inyectar valor inicial */
+    if (write(start_pipe[1], &value, sizeof value) != sizeof value)
+        DIE("write padre");
+    close(start_pipe[1]);
+
+    /* Esperar resultado */
+    if (read(result_pipe[0], &value, sizeof value) != sizeof value)
+        DIE("read resultado");
+    close(result_pipe[0]);
+
+    printf("Valor final recibido en el padre: %d\n", value);
 
     /* Esperar a todos los hijos */
     while (wait(NULL) > 0);
