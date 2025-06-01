@@ -1,119 +1,79 @@
-#include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
-int main(int argc, char **argv)
-{	
-	int start, status, pid, n;
-	int buffer[1];
+static void die(const char *msg) { perror(msg); exit(EXIT_FAILURE); }
 
-	if (argc != 4){ printf("Uso: anillo <n> <c> <s> \n"); exit(0);}
-    
-    /* Parsing of arguments */
-	n = atoi(argv[1]);
-	buffer[0] = atoi(argv[2]);
-	start = atoi(argv[3]);
-
-    if (n < 3 || start < 1 || start > n) {
-        fprintf(stderr, "Argumentos inválidos. Asegúrese de que n ≥ 1 y 1 ≤ s ≤ n.\n");
-        exit(EXIT_FAILURE);
+int main(int argc, char *argv[])
+{
+    if (argc != 4) {
+        fprintf(stderr, "Uso: %s <n> <c> <s>\n", argv[0]);
+        return EXIT_FAILURE;
     }
-    printf("Se crearán %i procesos, se enviará el caracter %i desde proceso %i \n", n, buffer[0], start);
-    
-	/* 1) Crear n pipes */
-    int pipes[n][2];
-    for (int i = 0; i < n; i++) {
-        if (pipe(pipes[i]) < 0) {
-            perror("pipe");
-            exit(EXIT_FAILURE);
+    int n = atoi(argv[1]), val = atoi(argv[2]), s = atoi(argv[3]);
+    if (n < 3 || s < 1 || s > n) {
+        fprintf(stderr, "Argumentos inválidos\n");
+        return EXIT_FAILURE;
+    }
+
+    /* 1) Pipes del anillo entre hijos */
+    int ring[n][2];
+    for (int i = 0; i < n; ++i) if (pipe(ring[i])) die("pipe");
+
+    /* 2) Pipe hijo_last → padre  y  padre → hijo_s                    */
+    int p_last2par[2], p_par2start[2];
+    if (pipe(p_last2par) || pipe(p_par2start)) die("pipe-parent");
+
+    int last = (s + n - 2) % n;            /* hijo que cierra el lazo   */
+
+    for (int i = 0; i < n; ++i) {
+        pid_t pid = fork();
+        if (pid < 0) die("fork");
+
+        if (pid == 0) {                    /* ====== HIJO i ====== */
+            /* Elegir fds de entrada y salida */
+            int in_fd  = (i == (s-1)) ? p_par2start[0]
+                       : ring[(i-1+n)%n][0];
+
+            int out_fd = (i == last) ? p_last2par[1]
+                       : ring[i][1];
+
+            /* Cerrar todo lo que no se usa */
+            for (int j = 0; j < n; ++j) {
+                close(ring[j][0]); close(ring[j][1]);
+            }
+            close(p_par2start[1]);               /* ya lo usa el padre  */
+            close(p_last2par[0]);                /* idem               */
+            if (i != (s-1))  close(p_par2start[0]);
+            if (i != last )  close(p_last2par[1]);
+
+            /* Trabajo: leer, ++, escribir y terminar */
+            if (read(in_fd, &val, sizeof(val)) != sizeof(val)) exit(EXIT_FAILURE);
+            ++val;
+            if (write(out_fd, &val, sizeof(val)) != sizeof(val)) exit(EXIT_FAILURE);
+
+            close(in_fd); close(out_fd);
+            _exit(EXIT_SUCCESS);
         }
+        /* ====== PADRE continúa el bucle para crear más hijos ====== */
     }
 
-	/* 2) Fork de los n hijos, indexados de 1 a n */
-	for (int i = 1; i <= n; i++) {
-    	pid = fork();
-    	if (pid < 0) {
-        	perror("fork");
-        	exit(EXIT_FAILURE);
-    	}
-    	if (pid == 0) {
-        	/* --- Código del hijo número i (1-based) --- */
-	        int idx  = i;
-    	    int prev = (idx == 1 ? n : idx - 1);
-        	int next = (idx == n ? 1 : idx + 1);
+    /* ====== PADRE ====== */
+    /* Cerrar extremos inútiles */
+    for (int i = 0; i < n; ++i) { close(ring[i][0]); close(ring[i][1]); }
+    close(p_par2start[0]);  close(p_last2par[1]);
 
-	        /* Descriptores que este hijo usará */
-    	    int read_fd  = pipes[prev - 1][0];  /* lee de (prev → idx) */
-        	int write_fd = pipes[idx - 1][1];   /* escribe a (idx → next) */
+    /* Enviar valor inicial y esperar resultado */
+    write(p_par2start[1], &val, sizeof(val));
+    close(p_par2start[1]);
 
-	        /* 2.a) Cerrar todos los extremos de pipe que NO se usarán */
-    	    for (int j = 0; j < n; j++) {
-        	    if (j != (prev - 1)) {
-            	    close(pipes[j][0]);
-	            }
-    	        if (j != (idx - 1)) {
-        	        close(pipes[j][1]);
-            	}
-	        }
+    if (read(p_last2par[0], &val, sizeof(val)) != sizeof(val))
+        die("read resultado");
+    printf("Resultado final: %d\n", val);
+    close(p_last2par[0]);
 
-    	    /* 2.b) Leer un entero, incrementarlo y reenviar */
-        	int valor;
-	        if (read(read_fd, &valor, sizeof(int)) != sizeof(int)) {
-    	        perror("read en hijo");
-        	    exit(EXIT_FAILURE);
-        	}
-	        valor++;  /* Incrementa el mensaje */
-
-	        if (write(write_fd, &valor, sizeof(int)) != sizeof(int)) {
-    	        perror("write en hijo");
-        	    exit(EXIT_FAILURE);
-	        }
-
-    	    /* 2.c) Cerrar los descriptores que usó */
-        	close(read_fd);
-        	close(write_fd);
-
-	        /* Termina este hijo */
-    	    _exit(EXIT_SUCCESS);
-	    }
-    /* El padre continúa creando el siguiente hijo */
-	}
-	int prev_start = (start == 1 ? n : start - 1);
-    int write_fd_parent = pipes[prev_start - 1][1];
-    int read_fd_parent = pipes[prev_start - 1][0];
-
-    /* 4) Cerrar en el padre todos los extremos que NO usará */
-    for (int j = 0; j < n; j++) {
-        if (j != (prev_start - 1)) {
-            close(pipes[j][0]);
-            close(pipes[j][1]);
-        }
-    }
-
-    /* 5) Inyectar el mensaje inicial en el anillo */
-    if (write(write_fd_parent, buffer, sizeof(int)) != sizeof(int)) {
-        perror("write inicial en padre");
-        exit(EXIT_FAILURE);
-    }
-
-    /* 6) Leer el mensaje final que regresa */
-    int resultado;
-    if (read(read_fd_parent, &resultado, sizeof(int)) != sizeof(int)) {
-        perror("read final en padre");
-        exit(EXIT_FAILURE);
-    }
-    printf("Mensaje final recibido en el padre: %d\n", resultado);
-
-    /* 7) Cerrar los fds usados */
-    close(write_fd_parent);
-    close(read_fd_parent);
-
-    /* 8) Esperar a que terminen todos los hijos */
-    for (int i = 0; i < n; i++) {
-        wait(&status);
-    }
-
-    return 0;
+    /* Esperar a todos los hijos */
+    while (wait(NULL) > 0);
+    return EXIT_SUCCESS;
 }
